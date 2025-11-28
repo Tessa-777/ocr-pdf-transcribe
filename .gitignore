@@ -1,0 +1,15 @@
+# Python and Virtual Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Project-Specific Temporary Files
+temp_files/
+
+# Streamlit/Caching Files
+.streamlit/
+.git/
