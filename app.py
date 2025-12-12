@@ -41,6 +41,51 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import subprocess
 import sys
+import pandas as pd
+
+# Try to load .env file - use python-dotenv if available, otherwise manual parsing
+script_dir = Path(__file__).parent.absolute()
+env_path = script_dir / ".env"
+
+# Try python-dotenv first
+env_loaded = False
+try:
+    from dotenv import load_dotenv
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+        env_loaded = True
+    else:
+        load_dotenv(override=True)
+        env_loaded = True
+except ImportError:
+    pass  # python-dotenv not installed, will use manual parser
+except Exception:
+    pass  # Error loading with python-dotenv, will use manual parser
+
+# If python-dotenv didn't work or isn't installed, manually parse .env file
+if not env_loaded and env_path.exists():
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=VALUE format
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Remove quotes if present
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    # Set environment variable (override=True behavior)
+                    if key and value:
+                        os.environ[key] = value
+    except Exception:
+        pass  # Silently fail if .env can't be read
 
 # ============================================================================
 # HARDWARE CONFIGURATION (Based on System Analysis)
@@ -92,13 +137,28 @@ TEMP_FOLDER = Path("temp_files")
 SUPPORTED_AUDIO_FORMAT = "m4a"
 MAX_IMAGE_SIZE = 1024  # Max dimension for Ollama to prevent OOM
 
+# Get Gemini API key from environment variable (.env file only)
+# Check environment variable (loaded from .env file)
+GEMINI_API_KEY_BACKEND = os.environ.get("GEMINI_API_KEY", "").strip()
+
 # Session state defaults for memo generator so state persists across reruns
 SESSION_DEFAULTS = {
     "memo_images": [],
-    "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
     "memo_source_name": None,
     "memo_page_input": "",
     "memo_pages_label": "",
+    # OCR batch processing
+    "ocr_file_queue": [],
+    "ocr_processed_files": [],
+    # Memo chat context
+    "memo_chat_history": [],
+    "memo_context": {
+        "ocr_results": {},
+        "extracted_passages": {},
+        "generated_memo": "",
+        "page_numbers": [],
+        "page_mapping": {}  # Maps displayed page numbers to PDF page numbers
+    },
 }
 for key, value in SESSION_DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -150,7 +210,7 @@ def check_tesseract():
 def configure_gemini(api_key: str):
     """Configure Gemini client with provided API key"""
     if not api_key:
-        return False, "Enter a Gemini API key to enable AI memos."
+        return False, "Set GEMINI_API_KEY in .env file to enable AI memos."
     try:
         genai.configure(api_key=api_key)
         return True, "Gemini connected."
@@ -268,6 +328,107 @@ def slugify_filename(text: str, default: str = "file"):
     cleaned = re.sub(r"[^\w\-.]", "", text)
     return cleaned or default
 
+def format_file_size(size_bytes: int) -> str:
+    """Format file size in human-readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
+
+def extract_text_from_pdf_page(pdf_path: Path, page_num: int) -> str:
+    """Extract text from a specific PDF page using PyMuPDF."""
+    try:
+        doc = fitz.open(pdf_path)
+        if 0 <= page_num - 1 < len(doc):
+            page = doc[page_num - 1]
+            text = page.get_text()
+            doc.close()
+            return text.strip()
+        doc.close()
+        return ""
+    except Exception as e:
+        return f"Error extracting text: {str(e)}"
+
+def extract_text_from_image(image_path: Path) -> str:
+    """Extract text from an image using OCR (requires OCR'd PDF or manual extraction)."""
+    # For now, return placeholder - in production, you'd use pytesseract or similar
+    return "[Image text extraction - OCR results would appear here]"
+
+def process_single_ocr_file(file_info: dict) -> dict:
+    """
+    Process a single file with OCR.
+    Returns dict with status, output_path, error message if any.
+    """
+    file_path = file_info["path"]
+    file_name = file_info["name"]
+    file_type = file_info["type"]
+    
+    try:
+        if file_type == "pdf":
+            # Process PDF with ocrmypdf
+            source_slug = slugify_filename(Path(file_name).stem, "document")
+            output_filename = f"ocr_{source_slug}.pdf"
+            output_path = TEMP_FOLDER / output_filename
+            
+            ocrmypdf.ocr(
+                file_path,
+                output_path,
+                deskew=True,
+                optimize=0,
+                skip_text=True,
+                jobs=OCR_JOBS,
+                fast_web_view=0
+            )
+            
+            return {
+                "status": "completed",
+                "output_path": str(output_path),
+                "output_filename": output_filename,
+                "error": None
+            }
+        else:
+            # For images, convert to PDF first, then OCR
+            # Save image temporarily
+            img_path = Path(file_path)
+            with Image.open(img_path) as img:
+                # Convert image to PDF
+                pdf_path = TEMP_FOLDER / f"temp_{Path(file_name).stem}.pdf"
+                img.save(pdf_path, "PDF", resolution=300.0)
+            
+            # OCR the PDF
+            source_slug = slugify_filename(Path(file_name).stem, "document")
+            output_filename = f"ocr_{source_slug}.pdf"
+            output_path = TEMP_FOLDER / output_filename
+            
+            ocrmypdf.ocr(
+                str(pdf_path),
+                output_path,
+                deskew=True,
+                optimize=0,
+                skip_text=True,
+                jobs=OCR_JOBS,
+                fast_web_view=0
+            )
+            
+            # Clean up temp PDF
+            if pdf_path.exists():
+                pdf_path.unlink()
+            
+            return {
+                "status": "completed",
+                "output_path": str(output_path),
+                "output_filename": output_filename,
+                "error": None
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "output_path": None,
+            "output_filename": None,
+            "error": str(e)
+        }
+
 # ============================================================================
 # SIDEBAR NAVIGATION
 # ============================================================================
@@ -294,20 +455,55 @@ st.sidebar.info(f"""
 """)
 
 st.sidebar.markdown("### 🔑 Gemini API")
-api_key_input = st.sidebar.text_input(
-    "Gemini API Key",
-    value=st.session_state["gemini_api_key"],
-    type="password",
-    help="Stored in session memory only (never written to disk)."
-)
-if api_key_input != st.session_state["gemini_api_key"]:
-    st.session_state["gemini_api_key"] = api_key_input.strip()
 
-gemini_status, gemini_msg = configure_gemini(st.session_state["gemini_api_key"])
-if gemini_status:
-    st.sidebar.success(gemini_msg)
+# Only use backend API key from .env file
+if GEMINI_API_KEY_BACKEND:
+    st.sidebar.success("✅ API key loaded from .env file")
+    st.sidebar.caption("Configured via GEMINI_API_KEY in .env")
+    gemini_status, gemini_msg = configure_gemini(GEMINI_API_KEY_BACKEND)
+    if gemini_status:
+        st.sidebar.success(gemini_msg)
+    else:
+        st.sidebar.error(gemini_msg)
 else:
-    st.sidebar.warning(gemini_msg)
+    st.sidebar.error("❌ API key not found")
+    st.sidebar.caption("Create a .env file with: GEMINI_API_KEY=your_key")
+    
+    # Debug info to help diagnose
+    script_dir = Path(__file__).parent.absolute()
+    env_path = script_dir / ".env"
+    try:
+        import dotenv
+        dotenv_installed = True
+    except ImportError:
+        dotenv_installed = False
+    
+    with st.sidebar.expander("🔍 Debug Info"):
+        st.write(f"**Script directory:** `{script_dir}`")
+        st.write(f"**.env path:** `{env_path}`")
+        st.write(f"**.env exists:** {env_path.exists()}")
+        st.write(f"**python-dotenv installed:** {dotenv_installed}")
+        if env_path.exists():
+            st.warning("⚠️ .env file exists but API key not loaded. Check the file format.")
+            st.code("GEMINI_API_KEY=your_key_here", language=None)
+            # Check if .env file has the key
+            try:
+                with open(env_path, 'r') as f:
+                    content = f.read()
+                    if 'GEMINI_API_KEY' in content:
+                        st.success("✅ GEMINI_API_KEY found in .env file")
+                    else:
+                        st.error("❌ GEMINI_API_KEY not found in .env file content")
+            except Exception as e:
+                st.error(f"Error reading .env: {e}")
+    
+    st.sidebar.info("""
+    **Setup Instructions:**
+    1. Create a `.env` file in the project root
+    2. Add: `GEMINI_API_KEY=your_api_key_here`
+    3. **Restart Streamlit completely** (stop and start again)
+    """)
+    gemini_status = False
 
 
 # ============================================================================
@@ -477,7 +673,7 @@ if tool == "The Archive (YouTube Transcriber)":
 
 elif tool == "The Digitizer (PDF OCR)":
     st.title("📄 The Digitizer - PDF OCR")
-    st.markdown("Make your PDFs searchable with OCR technology.")
+    st.markdown("Make your PDFs searchable with OCR technology. Upload multiple files for batch processing.")
     
     # Check for Tesseract
     if not check_tesseract():
@@ -490,229 +686,600 @@ elif tool == "The Digitizer (PDF OCR)":
         """)
         st.stop()
     
-    uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+    st.info(f"📊 OCR will use **{OCR_JOBS} parallel jobs** (optimized for your {CPU_LOGICAL_PROCESSORS} threads)")
     
-    if uploaded_file is not None:
-        st.info(f"📊 OCR will use **{OCR_JOBS} parallel jobs** (optimized for your {CPU_LOGICAL_PROCESSORS} threads)")
+    uploaded_files = st.file_uploader(
+        "Upload PDF or Image Files (Multiple files supported)", 
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True
+    )
+    
+    # Initialize queue if needed
+    if "ocr_file_queue" not in st.session_state:
+        st.session_state["ocr_file_queue"] = []
+    if "ocr_processed_files" not in st.session_state:
+        st.session_state["ocr_processed_files"] = []
+    
+    # Add new files to queue
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            # Check if file already in queue
+            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+            existing = [f for f in st.session_state["ocr_file_queue"] if f.get("id") == file_id]
+            existing_processed = [f for f in st.session_state["ocr_processed_files"] if f.get("id") == file_id]
+            
+            if not existing and not existing_processed:
+                # Save file to temp
+                file_ext = Path(uploaded_file.name).suffix.lower()
+                file_type = "pdf" if file_ext == ".pdf" else "image"
+                file_path = TEMP_FOLDER / f"ocr_input_{len(st.session_state['ocr_file_queue'])}{file_ext}"
+                
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                
+                st.session_state["ocr_file_queue"].append({
+                    "id": file_id,
+                    "name": uploaded_file.name,
+                    "size": uploaded_file.size,
+                    "type": file_type,
+                    "path": str(file_path),
+                    "status": "pending"
+                })
+    
+    # Display file queue
+    if st.session_state["ocr_file_queue"] or st.session_state["ocr_processed_files"]:
+        st.subheader("📋 File Queue")
         
-        if st.button("Process PDF", type="primary"):
-            with st.spinner("Processing PDF with OCR (this may take a while)..."):
-                try:
-                    # Save uploaded file to temp
-                    input_path = TEMP_FOLDER / "input.pdf"
-                    with open(input_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
+        # Show pending files
+        if st.session_state["ocr_file_queue"]:
+            st.markdown("**Pending Files:**")
+            queue_df_data = []
+            for file_info in st.session_state["ocr_file_queue"]:
+                queue_df_data.append({
+                    "Filename": file_info["name"],
+                    "Size": format_file_size(file_info["size"]),
+                    "Type": file_info["type"].upper(),
+                    "Status": "⏳ Pending"
+                })
+            
+            queue_df = pd.DataFrame(queue_df_data)
+            st.dataframe(queue_df, use_container_width=True, hide_index=True)
+        
+        # Show processed files
+        if st.session_state["ocr_processed_files"]:
+            st.markdown("**Processed Files:**")
+            processed_df_data = []
+            for file_info in st.session_state["ocr_processed_files"]:
+                status_icon = "✅" if file_info["status"] == "completed" else "❌"
+                processed_df_data.append({
+                    "Filename": file_info["name"],
+                    "Size": format_file_size(file_info["size"]),
+                    "Status": f"{status_icon} {file_info['status'].title()}"
+                })
+            
+            processed_df = pd.DataFrame(processed_df_data)
+            st.dataframe(processed_df, use_container_width=True, hide_index=True)
+            
+            # Download buttons for completed files
+            st.markdown("**Download Processed Files:**")
+            for file_info in st.session_state["ocr_processed_files"]:
+                if file_info["status"] == "completed" and file_info.get("output_path"):
+                    output_path = Path(file_info["output_path"])
+                    if output_path.exists():
+                        with open(output_path, "rb") as f:
+                            st.download_button(
+                                label=f"📥 Download {file_info['output_filename']}",
+                                data=f.read(),
+                                file_name=file_info["output_filename"],
+                                mime="application/pdf",
+                                key=f"download_{file_info['id']}"
+                            )
+        
+        # Process button
+        if st.session_state["ocr_file_queue"]:
+            if st.button("🚀 Process All Files", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                total_files = len(st.session_state["ocr_file_queue"])
+                processed_count = 0
+                
+                # Process files sequentially
+                queue_copy = st.session_state["ocr_file_queue"].copy()
+                for idx, file_info in enumerate(queue_copy):
+                    status_text.text(f"Processing {file_info['name']} ({idx + 1}/{total_files})...")
                     
-                    # Output path
-                    source_slug = slugify_filename(Path(uploaded_file.name).stem, "document")
-                    output_filename = f"ocr_{source_slug}.pdf"
-                    output_path = TEMP_FOLDER / output_filename
+                    # Update status to processing
+                    file_info["status"] = "processing"
                     
-                    # Run ocrmypdf with optimizations
-                    ocrmypdf.ocr(
-                        input_path,
-                        output_path,
-                        deskew=True,
-                        optimize=0,  # Disable slow image re-compression for speed
-                        skip_text=True,
-                        jobs=OCR_JOBS,  # Use 11 parallel jobs (12 threads - 1)
-                        fast_web_view=0  # Disable for speed
+                    # Process the file
+                    result = process_single_ocr_file(file_info)
+                    
+                    # Move to processed list
+                    file_info["status"] = result["status"]
+                    file_info["output_path"] = result.get("output_path")
+                    file_info["output_filename"] = result.get("output_filename")
+                    file_info["error"] = result.get("error")
+                    
+                    st.session_state["ocr_processed_files"].append(file_info)
+                    st.session_state["ocr_file_queue"].remove(
+                        next(f for f in st.session_state["ocr_file_queue"] if f["id"] == file_info["id"])
                     )
                     
-                    st.success("PDF processed successfully!")
+                    processed_count += 1
+                    progress_bar.progress(processed_count / total_files)
                     
-                    # Download button
-                    with open(output_path, "rb") as f:
-                        st.download_button(
-                            label="📥 Download Searchable PDF",
-                            data=f.read(),
-                            file_name=output_filename,
-                            mime="application/pdf"
-                        )
+                    if result["status"] == "error":
+                        st.warning(f"Error processing {file_info['name']}: {result['error']}")
                 
-                except Exception as e:
-                    st.error(f"Error processing PDF: {str(e)}")
-                    st.exception(e)
+                status_text.text("✅ Batch processing complete!")
+                st.success(f"Processed {processed_count} file(s). Files are saved and ready for download.")
+                st.rerun()
+        
+        # Clear queue button
+        if st.session_state["ocr_file_queue"]:
+            if st.button("🗑️ Clear Pending Queue"):
+                # Remove files from disk
+                for file_info in st.session_state["ocr_file_queue"]:
+                    file_path = Path(file_info["path"])
+                    if file_path.exists():
+                        file_path.unlink()
+                st.session_state["ocr_file_queue"] = []
+                st.rerun()
+        
+        # Clear processed files button
+        if st.session_state["ocr_processed_files"]:
+            if st.button("🗑️ Clear Processed Files"):
+                # Remove output files from disk
+                for file_info in st.session_state["ocr_processed_files"]:
+                    if file_info.get("output_path"):
+                        output_path = Path(file_info["output_path"])
+                        if output_path.exists():
+                            output_path.unlink()
+                st.session_state["ocr_processed_files"] = []
+                st.rerun()
 
 elif tool == "The Auto-Marker (Memo Generator)":
     st.title("✅ The Auto-Marker - Memo Generator")
-    st.markdown("Generate marking memos from PDF pages or images using Gemini.")
+    st.markdown("Generate marking memos from PDF pages or images using Gemini. Use the chat interface to correct AI assumptions.")
     
     if not gemini_status:
-        st.warning("Enter your Gemini API key in the sidebar to enable this tool.")
-    
-    uploaded_file = st.file_uploader(
-        "Upload PDF, PNG, or JPG", 
-        type=["pdf", "png", "jpg", "jpeg"]
-    )
-    
-    if uploaded_file is not None:
-        file_ext = Path(uploaded_file.name).suffix.lower()
-        source_name = Path(uploaded_file.name).stem
-        st.session_state["memo_source_name"] = source_name
+        st.error("⚠️ Gemini API key not configured")
+        st.info("""
+        **To enable this tool, set up your API key:**
         
-        if file_ext == ".pdf":
-            st.subheader("PDF Page Selection")
+        1. Create a `.env` file in the project root directory
+        2. Add the following line:
+           ```
+           GEMINI_API_KEY=your_api_key_here
+           ```
+        3. Get your API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
+        4. Restart the Streamlit app
+        
+        The API key must be set in the `.env` file - manual entry is not supported.
+        """)
+    
+    # Initialize chat and context if needed
+    if "memo_chat_history" not in st.session_state:
+        st.session_state["memo_chat_history"] = []
+    if "memo_context" not in st.session_state:
+        st.session_state["memo_context"] = {
+            "ocr_results": {},
+            "extracted_passages": {},
+            "generated_memo": "",
+            "page_numbers": [],
+            "page_mapping": {},
+            "pdf_path": None
+        }
+    
+    # Main content area - split into two columns for chat
+    col_main, col_chat = st.columns([2, 1])
+    
+    with col_main:
+        uploaded_file = st.file_uploader(
+            "Upload PDF, PNG, or JPG", 
+            type=["pdf", "png", "jpg", "jpeg"]
+        )
+        
+        if uploaded_file is not None:
+            file_ext = Path(uploaded_file.name).suffix.lower()
+            source_name = Path(uploaded_file.name).stem
+            st.session_state["memo_source_name"] = source_name
             
-            pdf_path = TEMP_FOLDER / "memo_input.pdf"
-            with open(pdf_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            doc = fitz.open(pdf_path)
-            total_pages = len(doc)
-            doc.close()
-            
-            if not st.session_state["memo_page_input"]:
-                st.session_state["memo_page_input"] = "1"
-            
-            page_input = st.text_input(
-                "Pages to Process (e.g., 10-15, 22, 50-60)",
-                value=st.session_state["memo_page_input"],
-                placeholder="1-3, 5, 10-12"
-            )
-            if page_input != st.session_state["memo_page_input"]:
-                st.session_state["memo_page_input"] = page_input
-            
-            st.caption("Tip: Keep batches small (3-5 pages) for best performance.")
-            
-            if st.button("Load Pages", type="primary"):
-                parsed_pages, errors = parse_page_input(page_input, total_pages)
-                if errors:
-                    for err in errors:
-                        st.warning(err)
-                if not parsed_pages:
-                    st.warning("No valid pages to load. Please adjust your input.")
-                else:
-                    st.session_state["memo_pages_label"] = compress_pages(parsed_pages)
-                    new_images = []
-                    with st.spinner("Converting selected pages to images..."):
-                        try:
-                            doc = fitz.open(pdf_path)
+            if file_ext == ".pdf":
+                st.subheader("PDF Page Selection")
+                
+                pdf_path = TEMP_FOLDER / "memo_input.pdf"
+                with open(pdf_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                
+                # Store PDF path in context
+                st.session_state["memo_context"]["pdf_path"] = str(pdf_path)
+                
+                doc = fitz.open(pdf_path)
+                total_pages = len(doc)
+                doc.close()
+                
+                if not st.session_state["memo_page_input"]:
+                    st.session_state["memo_page_input"] = "1"
+                
+                page_input = st.text_input(
+                    "Pages to Process (e.g., 10-15, 22, 50-60)",
+                    value=st.session_state["memo_page_input"],
+                    placeholder="1-3, 5, 10-12"
+                )
+                if page_input != st.session_state["memo_page_input"]:
+                    st.session_state["memo_page_input"] = page_input
+                
+                st.caption("Tip: Keep batches small (3-5 pages) for best performance.")
+                
+                if st.button("Load Pages", type="primary"):
+                    parsed_pages, errors = parse_page_input(page_input, total_pages)
+                    if errors:
+                        for err in errors:
+                            st.warning(err)
+                    if not parsed_pages:
+                        st.warning("No valid pages to load. Please adjust your input.")
+                    else:
+                        st.session_state["memo_pages_label"] = compress_pages(parsed_pages)
+                        st.session_state["memo_context"]["page_numbers"] = parsed_pages.copy()
+                        
+                        # Extract OCR text for context
+                        ocr_results = {}
+                        for page_num in parsed_pages:
+                            ocr_text = extract_text_from_pdf_page(pdf_path, page_num)
+                            ocr_results[page_num] = ocr_text
+                        st.session_state["memo_context"]["ocr_results"] = ocr_results
+                        
+                        new_images = []
+                        with st.spinner("Converting selected pages to images..."):
                             try:
-                                for page_number in parsed_pages:
-                                    page = doc[page_number - 1]
-                                    mat = fitz.Matrix(2.0, 2.0)
-                                    pix = page.get_pixmap(matrix=mat)
-                                    image_path = TEMP_FOLDER / f"page_{page_number}.png"
-                                    pix.save(str(image_path))
-                                    new_images.append({
-                                        "path": str(image_path),
-                                        "label": f"{uploaded_file.name} • Page {page_number}",
-                                        "size": (pix.width, pix.height)
-                                    })
-                            finally:
-                                doc.close()
+                                doc = fitz.open(pdf_path)
+                                try:
+                                    for page_number in parsed_pages:
+                                        page = doc[page_number - 1]
+                                        mat = fitz.Matrix(2.0, 2.0)
+                                        pix = page.get_pixmap(matrix=mat)
+                                        image_path = TEMP_FOLDER / f"page_{page_number}.png"
+                                        pix.save(str(image_path))
+                                        new_images.append({
+                                            "path": str(image_path),
+                                            "label": f"{uploaded_file.name} • Page {page_number}",
+                                            "size": (pix.width, pix.height),
+                                            "pdf_page": page_number
+                                        })
+                                finally:
+                                    doc.close()
+                                
+                                if new_images:
+                                    st.session_state["memo_images"] = new_images
+                                    # Initialize page mapping (PDF page = displayed page by default)
+                                    page_mapping = {img["pdf_page"]: img["pdf_page"] for img in new_images}
+                                    st.session_state["memo_context"]["page_mapping"] = page_mapping
+                                    st.success(f"Loaded {len(new_images)} page(s) successfully.")
+                                else:
+                                    st.warning("No pages were loaded. Please adjust your selection and try again.")
+                            except Exception as e:
+                                st.error(f"Error processing PDF: {str(e)}")
+                                st.exception(e)
+            
+            else:
+                image_path = TEMP_FOLDER / uploaded_file.name
+                with open(image_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                
+                with Image.open(image_path) as img:
+                    size = img.size
+                
+                st.session_state["memo_pages_label"] = "Image"
+                st.session_state["memo_page_input"] = ""
+                st.session_state["memo_images"] = [{
+                    "path": str(image_path),
+                    "label": uploaded_file.name,
+                    "size": size,
+                    "pdf_page": 1
+                }]
+                st.session_state["memo_context"]["page_numbers"] = [1]
+                st.session_state["memo_context"]["page_mapping"] = {1: 1}
+                st.success("Image loaded successfully!")
+        
+        memo_images = st.session_state.get("memo_images", [])
+        
+        if memo_images:
+            st.subheader("Loaded Pages")
+            for idx, img_meta in enumerate(memo_images, start=1):
+                pdf_page = img_meta.get("pdf_page", idx)
+                st.write(f"**{idx}. {img_meta['label']}** — {img_meta['size'][0]}x{img_meta['size'][1]} px (PDF Page {pdf_page})")
+            
+            preview_path = Path(memo_images[0]["path"])
+            if preview_path.exists():
+                with Image.open(preview_path) as preview_img:
+                    st.image(preview_img, caption=memo_images[0]["label"], width="stretch")
+            else:
+                st.warning("Preview image missing from disk. Reload the pages to continue.")
+        
+        if memo_images:
+            if st.button("Generate Memo", type="primary"):
+                if not gemini_status:
+                    st.error("⚠️ Gemini API key not configured. Set GEMINI_API_KEY in your .env file and restart the app.")
+                else:
+                    with st.spinner("Gemini is generating memos..."):
+                        try:
+                            model = genai.GenerativeModel(GEMINI_MODEL_NAME, safety_settings=SAFETY_SETTINGS)
+                            memo_sections = []
                             
-                            if new_images:
-                                st.session_state["memo_images"] = new_images
-                                st.success(f"Loaded {len(new_images)} page(s) successfully.")
+                            for idx, img_meta in enumerate(memo_images, start=1):
+                                image_path = Path(img_meta["path"])
+                                if not image_path.exists():
+                                    st.warning(f"Skipped {img_meta['label']} (file missing).")
+                                    continue
+                                
+                                current_size = img_meta.get("size")
+                                if current_size and max(current_size) > MAX_IMAGE_SIZE:
+                                    image_path = resize_image_for_model(image_path, MAX_IMAGE_SIZE)
+                                
+                                with Image.open(image_path) as pil_image:
+                                    system_prompt = (
+                                        "You are a Grade 3 Teacher. Analyze the worksheet page and:\n"
+                                        "1. Identify each question.\n"
+                                        "2. Solve it accurately.\n"
+                                        "3. Produce a clean marking memo with numbered answers.\n"
+                                        "If the page has no questions, respond with 'No questions found.'"
+                                    )
+                                    
+                                    response = model.generate_content(
+                                        [system_prompt, pil_image],
+                                        safety_settings=SAFETY_SETTINGS
+                                    )
+                                    memo_text = (response.text or "").strip()
+                                
+                                if not memo_text:
+                                    memo_text = "No response generated."
+                                
+                                memo_sections.append(f"### {img_meta['label']}\n{memo_text}")
+                                
+                                # Store extracted passages in context
+                                pdf_page = img_meta.get("pdf_page", idx)
+                                st.session_state["memo_context"]["extracted_passages"][pdf_page] = memo_text
+                                
+                                if idx < len(memo_images):
+                                    st.info(f"Rate Limit Safety: Waiting {GEMINI_DELAY_SECONDS} seconds before starting the next page...")
+                                    time.sleep(GEMINI_DELAY_SECONDS)
+                            
+                            if memo_sections:
+                                combined_memo = "\n\n".join(memo_sections)
+                                st.session_state["memo_context"]["generated_memo"] = combined_memo
+                                st.success("Memo generated!")
+                                st.subheader("Generated Memo")
+                                st.markdown(combined_memo)
+                                
+                                source_name = st.session_state.get("memo_source_name") or "Memo"
+                                pages_label = st.session_state.get("memo_pages_label") or compress_pages(
+                                    list(range(1, len(memo_images) + 1))
+                                )
+                                memo_filename = build_memo_filename(source_name, pages_label)
+                                
+                                memo_path = TEMP_FOLDER / memo_filename
+                                with open(memo_path, "w", encoding="utf-8") as f:
+                                    f.write(combined_memo)
+                                
+                                with open(memo_path, "rb") as f:
+                                    st.download_button(
+                                        label="📥 Download Memo",
+                                        data=f.read(),
+                                        file_name=memo_filename,
+                                        mime="text/plain"
+                                    )
                             else:
-                                st.warning("No pages were loaded. Please adjust your selection and try again.")
+                                st.warning("No memos were generated. Please retry.")
+                        
                         except Exception as e:
-                            st.error(f"Error processing PDF: {str(e)}")
+                            st.error(f"Error generating memo: {str(e)}")
                             st.exception(e)
         
-        else:
-            image_path = TEMP_FOLDER / uploaded_file.name
-            with open(image_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+        # Always display the current memo if it exists (from initial generation or regeneration)
+        if st.session_state["memo_context"].get("generated_memo"):
+            st.markdown("---")
+            st.subheader("📄 Generated Memo")
+            st.markdown(st.session_state["memo_context"]["generated_memo"])
             
-            with Image.open(image_path) as img:
-                size = img.size
+            # Download button for current memo
+            source_name = st.session_state.get("memo_source_name") or "Memo"
+            pages_label = st.session_state.get("memo_pages_label") or compress_pages(
+                list(range(1, len(memo_images) + 1)) if memo_images else []
+            )
+            memo_filename = build_memo_filename(source_name, pages_label)
+            memo_path = TEMP_FOLDER / memo_filename
             
-            st.session_state["memo_pages_label"] = "Image"
-            st.session_state["memo_page_input"] = ""
-            st.session_state["memo_images"] = [{
-                "path": str(image_path),
-                "label": uploaded_file.name,
-                "size": size
-            }]
-            st.success("Image loaded successfully!")
+            if memo_path.exists():
+                with open(memo_path, "rb") as f:
+                    st.download_button(
+                        label="📥 Download Memo",
+                        data=f.read(),
+                        file_name=memo_filename,
+                        mime="text/plain",
+                        key="download_memo_main"
+                    )
     
-    memo_images = st.session_state.get("memo_images", [])
-    
-    if memo_images:
-        st.subheader("Loaded Pages")
-        for idx, img_meta in enumerate(memo_images, start=1):
-            st.write(f"**{idx}. {img_meta['label']}** — {img_meta['size'][0]}x{img_meta['size'][1]} px")
+    # Chat interface in sidebar column
+    with col_chat:
+        st.subheader("💬 Correction Chat")
+        st.caption("Correct AI assumptions about page references and content.")
         
-        preview_path = Path(memo_images[0]["path"])
-        if preview_path.exists():
-            with Image.open(preview_path) as preview_img:
-                st.image(preview_img, caption=memo_images[0]["label"], width="stretch")
-        else:
-            st.warning("Preview image missing from disk. Reload the pages to continue.")
-    
-    if memo_images:
-        if st.button("Generate Memo", type="primary"):
-            if not gemini_status:
-                st.error("Gemini API key missing. Please add it in the sidebar.")
+        # Display chat history
+        chat_container = st.container()
+        with chat_container:
+            if st.session_state["memo_chat_history"]:
+                for msg in st.session_state["memo_chat_history"]:
+                    if msg["role"] == "user":
+                        with st.chat_message("user"):
+                            st.write(msg["content"])
+                    else:
+                        with st.chat_message("assistant"):
+                            st.write(msg["content"])
             else:
-                with st.spinner("Gemini is generating memos..."):
+                st.info("💡 Use this chat to correct the AI's assumptions. For example:\n\n"
+                       "- \"The questions for this passage are actually on page 17 (top right corner).\"\n"
+                       "- \"Use the page number printed on the bottom left instead of the PDF page number.\"\n"
+                       "- \"This passage belongs to the section before the table, not after.\"")
+        
+        # Chat input
+        if memo_images and st.session_state["memo_context"].get("generated_memo"):
+            user_input = st.text_input(
+                "Type your correction or question:",
+                key="chat_input",
+                placeholder="e.g., Questions are on page 17, not 15..."
+            )
+            
+            if st.button("Send", key="send_chat") and user_input:
+                # Add user message to history
+                st.session_state["memo_chat_history"].append({
+                    "role": "user",
+                    "content": user_input
+                })
+                
+                # Process correction with AI
+                with st.spinner("Processing correction..."):
                     try:
                         model = genai.GenerativeModel(GEMINI_MODEL_NAME, safety_settings=SAFETY_SETTINGS)
-                        memo_sections = []
                         
-                        for idx, img_meta in enumerate(memo_images, start=1):
-                            image_path = Path(img_meta["path"])
-                            if not image_path.exists():
-                                st.warning(f"Skipped {img_meta['label']} (file missing).")
-                                continue
-                            
-                            current_size = img_meta.get("size")
-                            if current_size and max(current_size) > MAX_IMAGE_SIZE:
-                                image_path = resize_image_for_model(image_path, MAX_IMAGE_SIZE)
-                            
-                            with Image.open(image_path) as pil_image:
-                                system_prompt = (
-                                    "You are a Grade 3 Teacher. Analyze the worksheet page and:\n"
-                                    "1. Identify each question.\n"
-                                    "2. Solve it accurately.\n"
-                                    "3. Produce a clean marking memo with numbered answers.\n"
-                                    "If the page has no questions, respond with 'No questions found.'"
-                                )
-                                
-                                response = model.generate_content(
-                                    [system_prompt, pil_image],
-                                    safety_settings=SAFETY_SETTINGS
-                                )
-                                memo_text = (response.text or "").strip()
-                            
-                            if not memo_text:
-                                memo_text = "No response generated."
-                            
-                            memo_sections.append(f"### {img_meta['label']}\n{memo_text}")
-                            
-                            if idx < len(memo_images):
-                                st.info(f"Rate Limit Safety: Waiting {GEMINI_DELAY_SECONDS} seconds before starting the next page...")
-                                time.sleep(GEMINI_DELAY_SECONDS)
+                        # Build context for AI
+                        context_prompt = f"""You are helping correct a memo generation system. The user has provided a correction.
+
+CONTEXT:
+- OCR Results Available: {list(st.session_state['memo_context']['ocr_results'].keys())}
+- Page Numbers Processed: {st.session_state['memo_context']['page_numbers']}
+- Current Page Mapping: {st.session_state['memo_context']['page_mapping']}
+- Generated Memo: {st.session_state['memo_context']['generated_memo'][:500]}...
+
+USER CORRECTION: {user_input}
+
+Please:
+1. Acknowledge the correction
+2. Explain what will be updated
+3. If page numbers need to change, specify which pages
+4. Ask if the user wants to regenerate the memo with these corrections
+
+Be concise and helpful."""
+
+                        response = model.generate_content(
+                            context_prompt,
+                            safety_settings=SAFETY_SETTINGS
+                        )
+                        ai_response = (response.text or "").strip()
                         
-                        if memo_sections:
-                            combined_memo = "\n\n".join(memo_sections)
-                            st.success("Memo generated!")
-                            st.subheader("Generated Memo")
-                            st.markdown(combined_memo)
-                            
-                            source_name = st.session_state.get("memo_source_name") or "Memo"
-                            pages_label = st.session_state.get("memo_pages_label") or compress_pages(
-                                list(range(1, len(memo_images) + 1))
-                            )
-                            memo_filename = build_memo_filename(source_name, pages_label)
-                            
-                            memo_path = TEMP_FOLDER / memo_filename
-                            with open(memo_path, "w", encoding="utf-8") as f:
-                                f.write(combined_memo)
-                            
-                            with open(memo_path, "rb") as f:
-                                st.download_button(
-                                    label="📥 Download Memo",
-                                    data=f.read(),
-                                    file_name=memo_filename,
-                                    mime="text/plain"
-                                )
-                        else:
-                            st.warning("No memos were generated. Please retry.")
+                        # Add AI response to history
+                        st.session_state["memo_chat_history"].append({
+                            "role": "assistant",
+                            "content": ai_response
+                        })
+                        
+                        # Try to extract page number corrections from user input
+                        page_num_pattern = r'page\s+(\d+)'
+                        matches = re.findall(page_num_pattern, user_input.lower())
+                        if matches:
+                            # Update page mapping if page numbers mentioned
+                            for match in matches:
+                                page_num = int(match)
+                                # Try to infer which page should be updated
+                                # This is a simple heuristic - can be improved
+                                if page_num not in st.session_state["memo_context"]["page_mapping"]:
+                                    # Add new page mapping
+                                    st.session_state["memo_context"]["page_mapping"][page_num] = page_num
+                        
+                        st.rerun()
                     
                     except Exception as e:
-                        st.error(f"Error generating memo: {str(e)}")
-                        st.exception(e)
+                        st.error(f"Error processing correction: {str(e)}")
+                        st.session_state["memo_chat_history"].append({
+                            "role": "assistant",
+                            "content": f"Error: {str(e)}"
+                        })
+                        st.rerun()
+            
+            # Regenerate memo button
+            if st.session_state["memo_chat_history"]:
+                if st.button("🔄 Regenerate Memo with Corrections", type="primary"):
+                    if not gemini_status:
+                        st.error("⚠️ Gemini API key not configured. Set GEMINI_API_KEY in your .env file and restart the app.")
+                    else:
+                        with st.spinner("Regenerating memo with corrections..."):
+                            try:
+                                model = genai.GenerativeModel(GEMINI_MODEL_NAME, safety_settings=SAFETY_SETTINGS)
+                                
+                                # Build correction context
+                                correction_summary = "\n".join([
+                                    f"{msg['role']}: {msg['content']}" 
+                                    for msg in st.session_state["memo_chat_history"]
+                                ])
+                                
+                                memo_sections = []
+                                for idx, img_meta in enumerate(memo_images, start=1):
+                                    image_path = Path(img_meta["path"])
+                                    if not image_path.exists():
+                                        continue
+                                    
+                                    current_size = img_meta.get("size")
+                                    if current_size and max(current_size) > MAX_IMAGE_SIZE:
+                                        image_path = resize_image_for_model(image_path, MAX_IMAGE_SIZE)
+                                    
+                                    with Image.open(image_path) as pil_image:
+                                        system_prompt = (
+                                            f"You are a Grade 3 Teacher. Analyze the worksheet page and:\n"
+                                            f"1. Identify each question.\n"
+                                            f"2. Solve it accurately.\n"
+                                            f"3. Produce a clean marking memo with numbered answers.\n"
+                                            f"\nIMPORTANT CORRECTIONS FROM USER:\n{correction_summary}\n"
+                                            f"Please apply these corrections when analyzing this page.\n"
+                                            f"If the page has no questions, respond with 'No questions found.'"
+                                        )
+                                        
+                                        response = model.generate_content(
+                                            [system_prompt, pil_image],
+                                            safety_settings=SAFETY_SETTINGS
+                                        )
+                                        memo_text = (response.text or "").strip()
+                                    
+                                    if not memo_text:
+                                        memo_text = "No response generated."
+                                    
+                                    memo_sections.append(f"### {img_meta['label']}\n{memo_text}")
+                                    
+                                    pdf_page = img_meta.get("pdf_page", idx)
+                                    st.session_state["memo_context"]["extracted_passages"][pdf_page] = memo_text
+                                    
+                                    if idx < len(memo_images):
+                                        time.sleep(GEMINI_DELAY_SECONDS)
+                                
+                                if memo_sections:
+                                    combined_memo = "\n\n".join(memo_sections)
+                                    st.session_state["memo_context"]["generated_memo"] = combined_memo
+                                    
+                                    # Save to file
+                                    source_name = st.session_state.get("memo_source_name") or "Memo"
+                                    pages_label = st.session_state.get("memo_pages_label") or compress_pages(
+                                        list(range(1, len(memo_images) + 1))
+                                    )
+                                    memo_filename = build_memo_filename(source_name, pages_label)
+                                    memo_path = TEMP_FOLDER / memo_filename
+                                    with open(memo_path, "w", encoding="utf-8") as f:
+                                        f.write(combined_memo)
+                                    
+                                    # Add confirmation to chat
+                                    st.session_state["memo_chat_history"].append({
+                                        "role": "assistant",
+                                        "content": "✅ Memo regenerated with your corrections applied!"
+                                    })
+                                    
+                                    st.success("Memo regenerated!")
+                                    st.rerun()
+                            
+                            except Exception as e:
+                                st.error(f"Error regenerating memo: {str(e)}")
+                                st.exception(e)
+            
+            # Clear chat button
+            if st.session_state["memo_chat_history"]:
+                if st.button("🗑️ Clear Chat"):
+                    st.session_state["memo_chat_history"] = []
+                    st.rerun()

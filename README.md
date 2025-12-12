@@ -17,8 +17,10 @@ A local, offline educational toolkit for teachers in South Africa with three pow
 
 ### ✅ The Auto-Marker (Memo Generator)
 - Generate marking memos from PDF pages or images
-- AI-powered analysis using Ollama (minicpm-v model)
+- AI-powered analysis using Google Gemini
+- Interactive chat interface for correcting AI assumptions
 - Page selection for PDFs with preview
+- Batch OCR processing for multiple files
 
 ## Installation
 
@@ -33,10 +35,9 @@ A local, offline educational toolkit for teachers in South Africa with three pow
    - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
    - macOS: `brew install ffmpeg`
    - Linux: `sudo apt-get install ffmpeg`
-4. **Ollama** (for AI memo generation)
-   - Install from [ollama.ai](https://ollama.ai)
-   - Pull the minicpm-v model: `ollama pull minicpm-v`
-   - Start Ollama server: `ollama serve`
+4. **Google Gemini API Key** (for AI memo generation)
+   - Get your API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
+   - See "API Key Setup" section below for configuration options
 
 ### Setup
 
@@ -46,10 +47,32 @@ A local, offline educational toolkit for teachers in South Africa with three pow
 pip install -r requirements.txt
 ```
 
-3. Start Ollama (if using Auto-Marker):
-```bash
-ollama serve
-```
+3. **API Key Setup** (for Auto-Marker tool):
+   
+   You have three options to set your Gemini API key:
+   
+   **Option 1: Environment Variable (Recommended)**
+   ```bash
+   # Windows (PowerShell)
+   $env:GEMINI_API_KEY="your_api_key_here"
+   
+   # Windows (Command Prompt)
+   set GEMINI_API_KEY=your_api_key_here
+   
+   # macOS/Linux
+   export GEMINI_API_KEY="your_api_key_here"
+   ```
+   
+   **Option 2: .env File**
+   ```bash
+   # Create a .env file in the project root
+   echo "GEMINI_API_KEY=your_api_key_here" > .env
+   ```
+   Note: Requires `python-dotenv` package (included in requirements.txt)
+   
+   **Option 3: Manual Entry**
+   - If no API key is set, you can enter it in the sidebar when using the app
+   - This must be done each time you restart the app
 
 4. Run the Streamlit app:
 ```bash
@@ -59,20 +82,31 @@ streamlit run app.py
 ## Usage
 
 1. **The Archive**: Enter a YouTube URL, select language and model size, then click "Transcribe"
-2. **The Digitizer**: Upload a PDF and click "Process PDF" to make it searchable
-3. **The Auto-Marker**: Upload a PDF or image, select a page (if PDF), preview, then generate the memo
+2. **The Digitizer**: 
+   - Upload multiple PDF or image files for batch processing
+   - Files are processed sequentially and saved as they complete
+   - Download processed files individually
+3. **The Auto-Marker**: 
+   - Upload a PDF or image, select pages (if PDF), preview, then generate the memo
+   - Use the chat interface to correct AI assumptions about page references
+   - Regenerate memos with corrections applied
 
 ## Notes
 
 - All temporary files are stored in `temp_files/` folder and cleaned on startup
-- The application runs completely offline (except for YouTube downloads)
+- The application runs completely offline (except for YouTube downloads and Gemini API calls)
 - Bandwidth-efficient: only downloads audio, not video
-- Make sure Ollama is running before using the Auto-Marker tool
+- API key is stored securely: environment variables are preferred over manual entry
+- Batch OCR processing saves files as they complete (abort-safe)
 
 ## Troubleshooting
 
 - **Tesseract not found**: Install Tesseract and ensure it's in your system PATH
-- **Ollama connection error**: Make sure `ollama serve` is running
+- **Gemini API key not working**: 
+  - Check that your API key is set correctly (environment variable or .env file)
+  - Verify the key is valid at [Google AI Studio](https://makersuite.google.com/app/apikey)
+  - Check the sidebar for connection status
 - **FFmpeg errors**: Install FFmpeg and ensure it's in your system PATH
 - **Model download issues**: Some models may need to be downloaded on first use
+- **Batch OCR processing stopped**: Completed files are saved, you can download them even if processing was interrupted
 
