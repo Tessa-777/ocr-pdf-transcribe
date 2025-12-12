@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Educational Toolkit - Streamlit Application
 
 A local, offline educational toolkit for teachers in South Africa with three powerful tools for transcription, OCR, and AI-powered memo generation.
@@ -110,3 +111,7 @@ streamlit run app.py
 - **Model download issues**: Some models may need to be downloaded on first use
 - **Batch OCR processing stopped**: Completed files are saved, you can download them even if processing was interrupted
 
+=======
+# ocr-pdf-transcribe
+Wraps up 3 tasks in App - OCR PDFs, Transcribe Videos, Memo Generator
+>>>>>>> main
